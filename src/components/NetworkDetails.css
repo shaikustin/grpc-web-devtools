@@ -8,3 +8,29 @@
 .react-json-view svg {
     height: 0.9em !important;
 }
+
+.trace-id-container {
+  padding: 8px 4px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid var(--divider-color);
+}
+
+.trace-id-button {
+  background-color: #007ACC;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  transition: background-color 0.2s;
+}
+
+.trace-id-button:hover {
+  background-color: #005a9e;
+}
+
+.trace-id-button:active {
+  transform: translateY(1px);
+}

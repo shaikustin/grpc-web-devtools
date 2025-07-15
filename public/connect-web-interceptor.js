@@ -2,16 +2,18 @@
  * Reads the message from the stream and posts it to the window.
  * This is a generator function that will be passed to the response stream.
  */
-async function* readMessage(req, stream) {
+async function* readMessage(req, stream, responseHeaders = {}) {
   for await (const m of stream) {
     if (m) {
       const resp = m.toJson?.();
       window.postMessage({
         type: "__GRPCWEB_DEVTOOLS__",
-        methodType: "server_streaming",
+        url: req.url,
         method: req.method.name,
         request: req.message.toJson?.(),
         response: resp,
+        responseHeaders: responseHeaders,
+        pageUrl: window.location.href,
       }, "*");
     }
     yield m;
@@ -23,9 +25,18 @@ async function* readMessage(req, stream) {
  * and post a message to the window. This will allow us to access this message in the content script. This
  * is all to make the manifest v3 happy.
  */
-const interceptor = (next) => async (req) => {
+const connectInterceptor = (next) => async (req) => {
   try {
     const resp = await next(req);
+    
+    // Extract response headers
+    const responseHeaders = {};
+    if (resp.header) {
+      for (const [key, value] of resp.header) {
+        responseHeaders[key] = value;
+      }
+    }
+    
     if (!resp.stream) {
       window.postMessage({
         type: "__GRPCWEB_DEVTOOLS__",
@@ -33,12 +44,13 @@ const interceptor = (next) => async (req) => {
         method: req.method.name,
         request: req.message.toJson(),
         response: resp.message.toJson(),
+        responseHeaders: responseHeaders,
       }, "*")
       return resp;
     } else {
       return {
         ...resp,
-        message: readMessage(req, resp.message),
+        message: readMessage(req, resp.message, responseHeaders),
       }
     }
   } catch (e) {
@@ -57,7 +69,7 @@ const interceptor = (next) => async (req) => {
   }
 };
 
-window.__CONNECT_WEB_DEVTOOLS__ = interceptor;
+window.__CONNECT_WEB_DEVTOOLS__ = connectInterceptor;
 
 /**
  * Since we are loading inject.js as a script, the order at which it is loaded is not guaranteed.

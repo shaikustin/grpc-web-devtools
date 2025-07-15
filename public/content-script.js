@@ -1,6 +1,92 @@
 // Copyright (c) 2019 SafetyCulture Pty Ltd. All Rights Reserved.
 
 const injectContent = `
+
+// Intercept XMLHttpRequest to capture response headers and attach them to gRPC responses
+const originalXHROpen = XMLHttpRequest.prototype.open;
+const originalXHRSend = XMLHttpRequest.prototype.send;
+const activeRequests = new Map();
+
+// Global storage for the most recent headers (fallback)
+let mostRecentHeaders = {};
+let mostRecentHeadersTimestamp = 0;
+
+XMLHttpRequest.prototype.open = function(method, url, ...args) {
+  this._url = url;
+  this._method = method;
+  this._requestId = Date.now() + Math.random();
+  return originalXHROpen.call(this, method, url, ...args);
+};
+
+XMLHttpRequest.prototype.send = function(data) {
+  const xhr = this;
+  const originalOnReadyStateChange = xhr.onreadystatechange;
+  
+  // Store request info for gRPC-related requests
+  if (xhr._url && (xhr._url.includes('twirp') || xhr._url.includes('grpc') || xhr._url.includes('/gw/'))) {
+    activeRequests.set(xhr._requestId, {
+      url: xhr._url,
+      method: xhr._method,
+      startTime: Date.now(),
+      xhr: xhr
+    });
+  }
+  
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState === 4 && xhr._url && (xhr._url.includes('twirp') || xhr._url.includes('grpc') || xhr._url.includes('/gw/'))) {
+      // Parse response headers
+      const headers = {};
+      const responseHeaders = xhr.getAllResponseHeaders();
+      if (responseHeaders) {
+        responseHeaders.split('\\r\\n').forEach(line => {
+          const parts = line.split(': ');
+          if (parts.length === 2) {
+            headers[parts[0].toLowerCase()] = parts[1];
+          }
+        });
+      }
+      
+      // Store as most recent headers for fallback
+      const now = Date.now();
+      mostRecentHeaders = headers;
+      mostRecentHeadersTimestamp = now;
+      
+      // Store directly on the XHR object for immediate access
+      xhr._grpcHeaders = headers;
+      
+      
+      // Clean up
+      activeRequests.delete(xhr._requestId);
+    }
+    
+    if (originalOnReadyStateChange) {
+      originalOnReadyStateChange.call(xhr);
+    }
+  };
+  
+  return originalXHRSend.call(this, data);
+};
+
+// Function to find headers for a gRPC method
+function findHeadersForMethod(method) {
+  // First, try to find headers from active/recent XHR requests
+  const now = Date.now();
+  
+  // Check active requests
+  for (const [requestId, requestInfo] of activeRequests.entries()) {
+    if (requestInfo.xhr && requestInfo.xhr._grpcHeaders) {
+      return requestInfo.xhr._grpcHeaders;
+    }
+  }
+  
+  // Fallback to most recent headers if they're fresh (within 2 seconds)
+  if (now - mostRecentHeadersTimestamp < 2000 && Object.keys(mostRecentHeaders).length > 0) {
+    return mostRecentHeaders;
+  }
+  
+  return {};
+}
+
 window.__GRPCWEB_DEVTOOLS__ = function (clients) {
   if (clients.constructor !== Array) {
     return
@@ -68,21 +154,111 @@ window.__GRPCWEB_DEVTOOLS__ = function (clients) {
     client.client_.rpcCall_ = client.client_.rpcCall;
     client.client_.rpcCall2 = function (method, request, metadata, methodInfo, callback) {
       var posted = false;
-      var newCallback = function (err, response) {
+      var originalCallback = callback;
+      
+      // Store the call object to access its metadata later
+      var call = this.rpcCall_(method, request, metadata, methodInfo, function (err, response) {
         if (!posted) {
+          // Extract response headers from different sources
+          var responseHeaders = {};
+          
+          // Try multiple ways to get headers from the call object
+          if (call) {
+            // Try getResponseHeaders
+            if (call.getResponseHeaders) {
+              var headers = call.getResponseHeaders();
+              if (headers) {
+                for (var key in headers) {
+                  responseHeaders[key] = headers[key];
+                }
+              }
+            }
+            
+            // Try getMetadata
+            if (call.getMetadata) {
+              var metadata = call.getMetadata();
+              if (metadata) {
+                for (var key in metadata) {
+                  responseHeaders[key] = metadata[key];
+                }
+              }
+            }
+            
+            // Try accessing headers_ property directly
+            if (call.headers_) {
+              for (var key in call.headers_) {
+                responseHeaders[key] = call.headers_[key];
+              }
+            }
+            
+            // Try accessing response headers from the call's response
+            if (call.response && call.response.headers) {
+              for (var key in call.response.headers) {
+                responseHeaders[key] = call.response.headers[key];
+              }
+            }
+          }
+          
+          // Also try to get headers from response object
+          if (response && response.getResponseHeaders) {
+            var headers = response.getResponseHeaders();
+            if (headers) {
+              for (var key in headers) {
+                responseHeaders[key] = headers[key];
+              }
+            }
+          }
+          
+          // Try to get headers from response metadata
+          if (response && response.getMetadata) {
+            var metadata = response.getMetadata();
+            if (metadata) {
+              for (var key in metadata) {
+                responseHeaders[key] = metadata[key];
+              }
+            }
+          }
+          
+          // If no headers found from gRPC sources, try XHR headers
+          if (Object.keys(responseHeaders).length === 0) {
+            const xhrHeaders = findHeadersForMethod(method);
+            if (xhrHeaders && Object.keys(xhrHeaders).length > 0) {
+              Object.assign(responseHeaders, xhrHeaders);
+            }
+          }
+          
+          // Get hostname from XHR requests
+          let requestHostname = window.location.hostname;
+          for (const [requestId, requestInfo] of activeRequests.entries()) {
+            if (requestInfo.url) {
+              try {
+                const url = new URL(requestInfo.url);
+                requestHostname = url.hostname;
+                break;
+              } catch (e) {
+                // Keep default
+              }
+            }
+          }
+          
+          
           window.postMessage({
             type: postType,
             method,
             methodType: "unary",
             request: request.toObject(),
             response: err ? undefined : response.toObject(),
+            responseHeaders: responseHeaders,
             error: err || undefined,
+            url: window.location.href,
+            hostname: requestHostname,
           }, "*")
           posted = true;
         }
-        callback(err, response)
-      }
-      return this.rpcCall_(method, request, metadata, methodInfo, newCallback);
+        originalCallback(err, response)
+      });
+      
+      return call;
     }
     client.client_.rpcCall = client.client_.rpcCall2;
     client.client_.unaryCall = function (method, request, metadata, methodInfo) {
@@ -92,6 +268,26 @@ window.__GRPCWEB_DEVTOOLS__ = function (clients) {
         });
       });
     };
+    
+    // Also intercept the raw transport to capture headers
+    if (client.client_.transport_) {
+      const originalTransport = client.client_.transport_;
+      const originalCall = originalTransport.call;
+      
+      originalTransport.call = function(method, request, metadata, methodInfo, callback) {
+        const wrappedCallback = function(err, response) {
+          if (response && response.getResponseHeaders) {
+            // Store headers in the response object for later access
+            const headers = response.getResponseHeaders();
+            if (headers) {
+              response._devtoolsHeaders = headers;
+            }
+          }
+          callback(err, response);
+        };
+        return originalCall.call(this, method, request, metadata, methodInfo, wrappedCallback);
+      };
+    }
     client.client_.serverStreaming_ = client.client_.serverStreaming;
     client.client_.serverStreaming2 = function (method, request, metadata, methodInfo) {
       var stream = client.client_.serverStreaming_(method, request, metadata, methodInfo);
